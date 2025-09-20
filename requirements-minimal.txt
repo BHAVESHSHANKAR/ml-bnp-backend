@@ -1,0 +1,16 @@
+# Minimal requirements for basic functionality
+flask
+flask-cors
+requests
+pillow
+pandas
+python-dateutil
+werkzeug
+
+# Optional ML dependencies (install if needed)
+# pytesseract
+# pdf2image  
+# spacy
+# pycountry
+# python-docx
+# openpyxl
