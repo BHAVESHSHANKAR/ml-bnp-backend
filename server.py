@@ -8,6 +8,15 @@ from werkzeug.utils import secure_filename
 import json
 from datetime import datetime
 import logging
+import zipfile
+import cloudinary
+import cloudinary.uploader
+import requests
+from io import BytesIO
+from dotenv import load_dotenv
+
+# Load environment variables from .env file
+load_dotenv()
 
 # Optional imports with fallbacks
 try:
@@ -77,6 +86,49 @@ CORS(app,
      allow_headers=['Content-Type', 'Authorization'],
      supports_credentials=True)
 
+# Configure Cloudinary for cloud storage
+cloudinary.config(
+    cloud_name=os.getenv('CLOUDINARY_CLOUD_NAME', 'your_cloud_name'),
+    api_key=os.getenv('CLOUDINARY_API_KEY', 'your_api_key'),
+    api_secret=os.getenv('CLOUDINARY_API_SECRET', 'your_api_secret')
+)
+
+# Verify Cloudinary configuration
+cloud_name = os.getenv('CLOUDINARY_CLOUD_NAME')
+if cloud_name and cloud_name != 'your_cloud_name':
+    logger.info(f"✅ Cloudinary configured with cloud: {cloud_name}")
+else:
+    logger.warning("⚠️ Cloudinary not properly configured - check .env file")
+
+# Cloud storage helper functions
+class CloudStorage:
+    @staticmethod
+    def upload_temp_file(file_data, filename):
+        """Upload file data to Cloudinary and return URL"""
+        try:
+            result = cloudinary.uploader.upload(
+                file_data,
+                resource_type="raw",
+                public_id=f"temp/{datetime.now().timestamp()}_{filename}",
+                folder="ml_temp"
+            )
+            return result['secure_url']
+        except Exception as e:
+            logger.error(f"Failed to upload to cloud: {e}")
+            return None
+    
+    
+    
+    @staticmethod
+    def cleanup_cloud_file(url):
+        """Delete file from Cloudinary"""
+        try:
+            # Extract public_id from URL
+            public_id = url.split('/')[-1].split('.')[0]
+            cloudinary.uploader.destroy(f"ml_temp/{public_id}", resource_type="raw")
+        except Exception as e:
+            logger.error(f"Failed to cleanup cloud file: {e}")
+
 # Load spaCy model
 nlp = None
 if SPACY_AVAILABLE:
@@ -89,24 +141,8 @@ if SPACY_AVAILABLE:
 else:
     logger.warning("⚠️ SpaCy not available - NLP features disabled")
 
-# Create temp directory for file processing
-TEMP_DIR = os.path.join(tempfile.gettempdir(), 'ml_backend_temp')
-os.makedirs(TEMP_DIR, exist_ok=True)
-logger.info(f"📁 Temporary directory created: {TEMP_DIR}")
-
-# Ensure temp directory has proper permissions
-try:
-    test_file = os.path.join(TEMP_DIR, 'test_write.txt')
-    with open(test_file, 'w') as f:
-        f.write('test')
-    os.remove(test_file)
-    logger.info("✅ Temporary directory write test successful")
-except Exception as e:
-    logger.error(f"❌ Temporary directory write test failed: {e}")
-    # Fallback to current directory
-    TEMP_DIR = os.path.join(os.getcwd(), 'temp')
-    os.makedirs(TEMP_DIR, exist_ok=True)
-    logger.info(f"📁 Using fallback temporary directory: {TEMP_DIR}")
+# No persistent temp directory - use system temp for individual files only
+logger.info("☁️ Cloud-only storage - no persistent temp directory")
 
 class DocumentProcessor:
     def __init__(self):
@@ -285,12 +321,137 @@ class DocumentProcessor:
         
         return extracted_text
     
-    def calculate_overall_risk(self, document_results, use_simple_average=False):
-        """Calculate overall risk assessment across all documents
+    def extract_pdf_text(self, file_path):
+        """Extract text from PDF file"""
+        return self.ocr_pdf(file_path)
+    
+    def extract_docx_text(self, file_path):
+        """Extract text from DOCX file"""
+        try:
+            from docx import Document
+            doc = Document(file_path)
+            text = ""
+            for paragraph in doc.paragraphs:
+                text += paragraph.text + "\n"
+            return text
+        except Exception as e:
+            return f"Error reading DOCX: {str(e)}"
+    
+    def extract_xlsx_text(self, file_path):
+        """Extract text from XLSX file"""
+        if not XLSX_AVAILABLE:
+            return "XLSX processing not available - missing openpyxl dependency"
+        
+        try:
+            from openpyxl import load_workbook
+            workbook = load_workbook(file_path, data_only=True)
+            text = ""
+            
+            for sheet_name in workbook.sheetnames:
+                sheet = workbook[sheet_name]
+                text += f"\n--- Sheet: {sheet_name} ---\n"
+                
+                for row in sheet.iter_rows(values_only=True):
+                    row_text = " ".join([str(cell) if cell is not None else "" for cell in row])
+                    if row_text.strip():
+                        text += row_text + "\n"
+            
+            return text
+        except Exception as e:
+            return f"Error reading XLSX: {str(e)}"
+    
+    def extract_pdf_from_bytes(self, pdf_bytes):
+        """Extract text from PDF bytes"""
+        try:
+            from io import BytesIO
+            import PyPDF2
+            
+            pdf_file = BytesIO(pdf_bytes)
+            pdf_reader = PyPDF2.PdfReader(pdf_file)
+            text = ""
+            
+            for page in pdf_reader.pages:
+                text += page.extract_text() + "\n"
+            
+            # If no text extracted, try OCR
+            if not text.strip():
+                text = self.ocr_pdf_from_bytes(pdf_bytes)
+            
+            return text
+        except Exception as e:
+            return f"Error reading PDF from bytes: {str(e)}"
+    
+    def extract_docx_from_bytes(self, docx_bytes):
+        """Extract text from DOCX bytes"""
+        try:
+            from io import BytesIO
+            from docx import Document
+            
+            docx_file = BytesIO(docx_bytes)
+            doc = Document(docx_file)
+            text = ""
+            
+            for paragraph in doc.paragraphs:
+                text += paragraph.text + "\n"
+            
+            return text
+        except Exception as e:
+            return f"Error reading DOCX from bytes: {str(e)}"
+    
+    def extract_xlsx_from_bytes(self, xlsx_bytes):
+        """Extract text from XLSX bytes"""
+        if not XLSX_AVAILABLE:
+            return "XLSX processing not available - missing openpyxl dependency"
+        
+        try:
+            from io import BytesIO
+            from openpyxl import load_workbook
+            
+            xlsx_file = BytesIO(xlsx_bytes)
+            workbook = load_workbook(xlsx_file, data_only=True)
+            text = ""
+            
+            for sheet_name in workbook.sheetnames:
+                sheet = workbook[sheet_name]
+                text += f"\n--- Sheet: {sheet_name} ---\n"
+                
+                for row in sheet.iter_rows(values_only=True):
+                    row_text = " ".join([str(cell) if cell is not None else "" for cell in row])
+                    if row_text.strip():
+                        text += row_text + "\n"
+            
+            return text
+        except Exception as e:
+            return f"Error reading XLSX from bytes: {str(e)}"
+    
+    def ocr_pdf_from_bytes(self, pdf_bytes):
+        """Convert PDF bytes to text using OCR"""
+        if not PDF2IMAGE_AVAILABLE or not PYTESSERACT_AVAILABLE:
+            return "PDF OCR not available - missing dependencies (pdf2image, pytesseract)"
+        
+        try:
+            from io import BytesIO
+            from pdf2image import convert_from_bytes
+            import pytesseract
+            
+            # Convert PDF bytes to images
+            images = convert_from_bytes(pdf_bytes)
+            text = ""
+            
+            for image in images:
+                # Extract text from each page image
+                page_text = pytesseract.image_to_string(image)
+                text += page_text + "\n"
+            
+            return text
+        except Exception as e:
+            return f"Error in PDF OCR from bytes: {str(e)}"
+    
+    def calculate_overall_risk(self, document_results):
+        """Calculate overall risk assessment across all documents using base average
         
         Args:
             document_results: List of document processing results
-            use_simple_average: If True, use simple average without adjustments
         """
         if not document_results:
             return {
@@ -352,15 +513,15 @@ class DocumentProcessor:
         
         if len(unique_names) > 1:
             risk_factors.append("Multiple different names found across documents")
-            risk_adjustments += 5  # Reduced from 15
+            risk_adjustments += 2  # Further reduced from 5
         
         if len(unique_countries) > 1:
             risk_factors.append("Multiple different countries found across documents")
-            risk_adjustments += 3  # Reduced from 10
+            risk_adjustments += 1  # Further reduced from 3
         
         if len(unique_dobs) > 1:
             risk_factors.append("Multiple different dates of birth found")
-            risk_adjustments += 8  # Reduced from 20
+            risk_adjustments += 3  # Further reduced from 8
         
         # 2. Document completeness analysis (more conservative)
         complete_documents = sum(1 for score in individual_scores if score == 0)
@@ -368,24 +529,24 @@ class DocumentProcessor:
         
         if incomplete_documents > 0:
             risk_factors.append(f"{incomplete_documents} documents missing critical information")
-            # More conservative adjustment - max 10 points instead of 25
-            risk_adjustments += min(10, (incomplete_documents / document_count) * 15)
+            # Much more conservative adjustment - max 5 points
+            risk_adjustments += min(5, (incomplete_documents / document_count) * 8)
         
-        # 3. Document quantity analysis (reduced penalties)
+        # 3. Document quantity analysis (minimal penalties)
         if document_count < 2:
             risk_factors.append("Insufficient number of documents for verification")
-            risk_adjustments += 5  # Reduced from 15
+            risk_adjustments += 2  # Further reduced from 5
         elif document_count >= 5:
             risk_factors.append("Comprehensive document portfolio provided")
-            risk_adjustments -= 3  # Reduced bonus from 5
+            risk_adjustments -= 2  # Reduced bonus from 3
         
-        # 4. Identity verification analysis (more conservative)
+        # 4. Identity verification analysis (minimal penalties)
         if not names_found:
             risk_factors.append("No names extracted from any document")
-            risk_adjustments += 10  # Reduced from 30
+            risk_adjustments += 5  # Further reduced from 10
         elif len(names_found) >= 3 and len(unique_names) == 1:
             risk_factors.append("Consistent name across multiple documents")
-            risk_adjustments -= 5  # Reduced bonus from 10
+            risk_adjustments -= 2  # Further reduced bonus from 5
         
         # 5. Expiry date analysis (reduced penalties)
         if card_expiries_found:
@@ -403,20 +564,20 @@ class DocumentProcessor:
             
             if expired_cards > 0:
                 risk_factors.append(f"{expired_cards} expired cards/documents found")
-                risk_adjustments += expired_cards * 5  # Reduced from 15
+                risk_adjustments += expired_cards * 2  # Further reduced from 5
         
-        print(f"📊 Risk adjustments: {risk_adjustments}")
+        # Cap risk adjustments to prevent overwhelming the base average
+        max_adjustment = 20  # Maximum 20 points adjustment
+        risk_adjustments = max(-max_adjustment, min(max_adjustment, risk_adjustments))
+        print(f"📊 Risk adjustments (capped): {risk_adjustments}")
         
-        # Calculate final risk score
-        if use_simple_average:
-            # Use simple average without any adjustments
-            final_risk_score = avg_individual_risk
-            print(f"📊 Using simple average (no adjustments): {final_risk_score}")
-        else:
-            # Apply adjustments but keep them reasonable
-            final_risk_score = avg_individual_risk + risk_adjustments
-            final_risk_score = min(100, max(0, final_risk_score))
-            print(f"📊 Final calculated risk score with adjustments: {final_risk_score}")
+        # Use base average as final score - this is the most accurate representation
+        final_risk_score = avg_individual_risk
+        print(f"📊 Final risk score (base average): {final_risk_score}")
+        
+        # Keep risk factors for transparency but don't let them override the math
+        if risk_adjustments != 0:
+            print(f"📊 Risk factors identified (informational only): {risk_adjustments} points")
         
         # Round to reasonable precision
         final_risk_score = round(final_risk_score, 1)
@@ -601,7 +762,8 @@ class DocumentProcessor:
             return "XLSX processing not available - missing openpyxl dependency"
         
         try:
-            workbook = openpyxl.load_workbook(xlsx_path, data_only=True)
+            from openpyxl import load_workbook
+            workbook = load_workbook(xlsx_path, data_only=True)
             text = ""
             
             for sheet_name in workbook.sheetnames:
@@ -609,17 +771,13 @@ class DocumentProcessor:
                 text += f"\n--- Sheet: {sheet_name} ---\n"
                 
                 for row in sheet.iter_rows(values_only=True):
-                    row_text = []
-                    for cell in row:
-                        if cell is not None:
-                            row_text.append(str(cell))
-                    if row_text:  # Only add non-empty rows
-                        text += " | ".join(row_text) + "\n"
+                    row_text = " ".join([str(cell) if cell is not None else "" for cell in row])
+                    if row_text.strip():
+                        text += row_text + "\n"
             
-            workbook.close()
             return text
         except Exception as e:
-            logger.error(f"Error processing XLSX {xlsx_path}: {str(e)}")
+            return f"Error reading XLSX: {str(e)}"
             return f"Error processing XLSX: {str(e)}"
     
     def extract_entities(self, text):
@@ -699,6 +857,37 @@ class DocumentProcessor:
             logger.error(f"Error extracting entities: {str(e)}")
         
         return extracted
+    
+    def extract_information(self, text, filename):
+        """Extract information from text and compute risk score"""
+        try:
+            # Extract entities from text
+            entities = self.extract_entities(text)
+            
+            # Compute risk score
+            risk_score = self.compute_risk(entities)
+            
+            # Create result structure
+            result = {
+                "filename": filename,
+                "NAME": entities.get("NAME"),
+                "DOB": entities.get("DOB"),
+                "COUNTRY": entities.get("COUNTRY"),
+                "COUNTRY_CODE": entities.get("COUNTRY_CODE"),
+                "CARD_EXPIRY_DATE": entities.get("CARD_EXPIRY_DATE"),
+                "Risk_Score": risk_score,
+                "extracted_text": text[:500] + "..." if len(text) > 500 else text  # First 500 chars
+            }
+            
+            return result
+            
+        except Exception as e:
+            logger.error(f"Error in extract_information for {filename}: {str(e)}")
+            return {
+                "filename": filename,
+                "error": str(e),
+                "Risk_Score": 100  # High risk for processing errors
+            }
     
     def compute_risk(self, entities):
         """Enhanced Risk Score: 0-100 based on missing fields and data quality"""
@@ -781,36 +970,73 @@ class DocumentProcessor:
             return "CRITICAL"
     
     def process_file(self, file_path, original_filename):
-        """Process a single file based on extension - matches ml.py.ipynb logic"""
+        """Process a single file and extract information"""
         try:
+            print(f"📄 Processing file: {original_filename}")
+            
+            # Get file extension
             ext = original_filename.lower().split('.')[-1]
             
+            # Process based on file type
             if ext == "pdf":
-                text = self.ocr_pdf(file_path)
+                text = self.extract_pdf_text(file_path)
             elif ext == "docx":
-                text = self.extract_docx(file_path)
+                text = self.extract_docx_text(file_path)
             elif ext == "txt":
-                text = self.extract_txt(file_path)
+                with open(file_path, 'r', encoding='utf-8', errors='ignore') as file:
+                    text = file.read()
             elif ext == "xlsx":
-                text = self.extract_xlsx(file_path)
+                text = self.extract_xlsx_text(file_path)
             else:
-                # Return None for unsupported files (matches notebook logic)
                 return None
             
-            entities = self.extract_entities(text)
-            entities["File"] = os.path.basename(original_filename)
-            entities["Risk_Score"] = self.compute_risk(entities)  # This now adds Risk_Details and Risk_Level
-            entities["Status"] = "Flagged" if entities["Risk_Score"] > 50 else "Verified"
-            entities["Card_Validity"] = "Provided" if entities["CARD_EXPIRY_DATE"] else "Not Provided"
-            entities["Processed_At"] = datetime.now().isoformat()
-            entities["Text_Length"] = len(text)
-            entities["Extracted_Text_Preview"] = text[:200] + "..." if len(text) > 200 else text
-            entities["Document_Quality"] = self.assess_document_quality(text, entities)
+            if not text or text.strip() == "":
+                print(f"⚠️ No text extracted from {original_filename}")
+                return None
             
-            return entities
-        
+            # Extract information using regex patterns
+            extracted_info = self.extract_information(text, original_filename)
+            
+            return extracted_info
+            
         except Exception as e:
             logger.error(f"Error processing file {original_filename}: {str(e)}")
+            return {
+                "error": str(e),
+                "filename": original_filename
+            }
+    
+    def process_file_content(self, file_content, original_filename):
+        """Process file directly from memory content"""
+        try:
+            print(f"☁️ Processing file from memory: {original_filename}")
+            
+            # Get file extension
+            ext = original_filename.lower().split('.')[-1]
+            
+            # Process based on file type
+            if ext == "pdf":
+                text = self.extract_pdf_from_bytes(file_content)
+            elif ext == "docx":
+                text = self.extract_docx_from_bytes(file_content)
+            elif ext == "txt":
+                text = file_content.decode('utf-8', errors='ignore')
+            elif ext == "xlsx":
+                text = self.extract_xlsx_from_bytes(file_content)
+            else:
+                return None
+            
+            if not text or text.strip() == "":
+                print(f"⚠️ No text extracted from {original_filename}")
+                return None
+            
+            # Extract information using regex patterns
+            extracted_info = self.extract_information(text, original_filename)
+            
+            return extracted_info
+            
+        except Exception as e:
+            logger.error(f"Error processing file content {original_filename}: {str(e)}")
             return {
                 "error": str(e),
                 "filename": original_filename
@@ -819,8 +1045,9 @@ class DocumentProcessor:
     def process_zip(self, zip_path, original_filename):
         """Process ZIP of PDFs/DOCX - matches ml.py.ipynb logic"""
         try:
-            extract_dir = os.path.join(TEMP_DIR, f"unzipped_files_{datetime.now().timestamp()}")
-            os.makedirs(extract_dir, exist_ok=True)
+            # Create temporary directory for extraction
+            import tempfile
+            extract_dir = tempfile.mkdtemp(prefix="ml_zip_")
             
             with zipfile.ZipFile(zip_path, 'r') as zip_ref:
                 zip_ref.extractall(extract_dir)
@@ -833,13 +1060,17 @@ class DocumentProcessor:
                     if result:  # Only add if not None (matches notebook logic)
                         results.append(result)
             
-            # Clean up extracted files
+            # Clean up temporary extraction directory
             shutil.rmtree(extract_dir, ignore_errors=True)
             
-            return results  # Return list directly (matches notebook logic)
-        
+            return results
         except Exception as e:
             logger.error(f"Error processing ZIP {original_filename}: {str(e)}")
+            # Clean up extraction directory in case of error
+            try:
+                shutil.rmtree(extract_dir, ignore_errors=True)
+            except:
+                pass
             return []
 
 # Initialize processor
@@ -849,20 +1080,27 @@ processor = DocumentProcessor()
 def health_check():
     """Health check endpoint"""
     return jsonify({
-        "status": "healthy",
-        "service": "ML Document Processing Server",
-        "timestamp": datetime.now().isoformat(),
-        "spacy_loaded": nlp is not None,
-        "supported_formats": processor.supported_extensions,
+        "status": "ML Backend is running",
+        "version": "1.0",
+        "endpoints": ["/process-files", "/test-risk-calculation", "/ping"],
+        "supported_formats": ["pdf", "docx", "zip", "txt", "xlsx"],
+        "cloud_storage": "enabled",
         "dependencies": {
-            "pdf2image": PDF2IMAGE_AVAILABLE,
-            "pytesseract": PYTESSERACT_AVAILABLE,
-            "python-docx": DOCX_AVAILABLE,
             "openpyxl": XLSX_AVAILABLE,
             "spacy": SPACY_AVAILABLE,
             "pycountry": PYCOUNTRY_AVAILABLE,
             "dateutil": DATEUTIL_AVAILABLE
         }
+    })
+
+@app.route('/ping', methods=['GET'])
+def ping():
+    """Simple keep-alive endpoint"""
+    return jsonify({
+        "status": "alive",
+        "timestamp": datetime.now().isoformat(),
+        "cloud_storage": "enabled",
+        "spacy": "ready" if nlp else "disabled"
     })
 
 @app.route('/process-files', methods=['POST'])
@@ -889,48 +1127,31 @@ def process_files():
             if file.filename == '':
                 continue
             
-            # Save file temporarily
             filename = secure_filename(file.filename)
-            temp_path = os.path.join(TEMP_DIR, f"{datetime.now().timestamp()}_{filename}")
-            
-            print(f"📁 Saving file to: {temp_path}")
-            print(f"📁 TEMP_DIR exists: {os.path.exists(TEMP_DIR)}")
-            print(f"📁 TEMP_DIR path: {TEMP_DIR}")
-            
-            # Ensure temp directory exists
-            os.makedirs(TEMP_DIR, exist_ok=True)
-            
-            file.save(temp_path)
-            
-            # Verify file was saved
-            if not os.path.exists(temp_path):
-                print(f"❌ File was not saved to {temp_path}")
-                errors.append({
-                    "filename": filename,
-                    "error": f"Failed to save file to temporary location"
-                })
-                continue
-            
-            print(f"✅ File saved successfully: {temp_path} (size: {os.path.getsize(temp_path)} bytes)")
             
             try:
-                print(f"Processing: {filename}")
+                print(f"⚡ Processing {filename} directly from upload...")
+                
+                # Read file content directly from upload (no local storage)
+                file.seek(0)  # Reset file pointer
+                file_content = file.read()
+                
+                print(f"✅ Got file content: {filename} (size: {len(file_content)} bytes)")
+                
+                # Process based on file type
                 ext = filename.lower().split('.')[-1]
+                print(f"Processing: {filename}")
                 
-                # Verify file still exists before processing
-                if not os.path.exists(temp_path):
-                    print(f"❌ File disappeared before processing: {temp_path}")
-                    errors.append({
-                        "filename": filename,
-                        "error": "File disappeared before processing"
-                    })
-                    continue
-                
-                # Process based on file type (matches notebook logic exactly)
                 if ext == "zip":
-                    res = processor.process_zip(temp_path, filename)
+                    # For ZIP, create minimal temp file for extraction only
+                    temp_file = tempfile.NamedTemporaryFile(delete=False, suffix=".zip", prefix="ml_")
+                    temp_file.write(file_content)
+                    temp_file.close()
+                    res = processor.process_zip(temp_file.name, filename)
+                    os.remove(temp_file.name)  # Clean up immediately
                 elif ext in ["pdf", "docx", "txt", "xlsx"]:
-                    r = processor.process_file(temp_path, filename)
+                    # Process directly from memory content
+                    r = processor.process_file_content(file_content, filename)
                     res = [r] if r else []
                 else:
                     print(f"Unsupported file type: {filename}")
@@ -941,17 +1162,25 @@ def process_files():
                     res = []
                 
                 all_results.extend(res)
+                
+                # After successful processing, upload to cloud for storage
+                if res:  # Only upload if processing was successful
+                    print(f"☁️ Uploading processed {filename} to cloud storage...")
+                    cloud_url = CloudStorage.upload_temp_file(file_content, filename)
+                    if cloud_url:
+                        print(f"✅ File stored in cloud: {cloud_url}")
+                        # Clean up immediately after upload
+                        CloudStorage.cleanup_cloud_file(cloud_url)
+                        print(f"🧹 Cleaned up cloud storage: {cloud_url}")
+                    else:
+                        print(f"⚠️ Failed to upload {filename} to cloud storage")
             
             except Exception as e:
+                print(f"❌ Error processing {filename}: {str(e)}")
                 errors.append({
                     "filename": filename,
                     "error": str(e)
                 })
-            
-            finally:
-                # Clean up temp file
-                if os.path.exists(temp_path):
-                    os.remove(temp_path)
         
         # Calculate overall risk assessment
         try:
@@ -960,11 +1189,10 @@ def process_files():
                 if isinstance(result, dict):
                     print(f"Document {i+1}: Risk_Score = {result.get('Risk_Score', 'Not found')}")
             
-            # Check if simple average is requested via query parameter
-            use_simple_average = request.args.get('simple_average', 'false').lower() == 'true'
-            print(f"📊 Using simple average: {use_simple_average}")
+            # Always use base average - it's the most accurate mathematical representation
+            print(f"📊 Using base average calculation")
                     
-            overall_risk = processor.calculate_overall_risk(all_results, use_simple_average=use_simple_average)
+            overall_risk = processor.calculate_overall_risk(all_results)
             print(f"✅ Overall risk calculated: {overall_risk.get('overall_risk_score', 'Unknown')}")
         except Exception as risk_error:
             logger.error(f"Error calculating overall risk: {str(risk_error)}")
@@ -1173,21 +1401,9 @@ def test_risk_calculation():
 
 if __name__ == '__main__':
     logger.info("🚀 Starting ML Document Processing Server...")
-    logger.info(f"📁 Temporary directory: {TEMP_DIR}")
+    logger.info("⚡ Deployment-ready: Direct processing from uploads - no local storage")
+    logger.info("☁️ Cloud storage for archival only - processing happens in memory")
     logger.info(f"🔧 SpaCy model loaded: {nlp is not None}")
-    
-    # Clean up old files in temp directory on startup (but keep the directory)
-    if os.path.exists(TEMP_DIR):
-        try:
-            for filename in os.listdir(TEMP_DIR):
-                file_path = os.path.join(TEMP_DIR, filename)
-                if os.path.isfile(file_path):
-                    os.remove(file_path)
-            logger.info("🧹 Cleaned up old temporary files")
-        except Exception as e:
-            logger.warning(f"⚠️ Could not clean up temp directory: {e}")
-    else:
-        os.makedirs(TEMP_DIR, exist_ok=True)
     
     # Listen on both IPv4 and IPv6
     app.run(host='127.0.0.1', port=5001, debug=True)
