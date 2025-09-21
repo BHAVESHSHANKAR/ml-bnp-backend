@@ -23,11 +23,14 @@ COPY requirements.txt .
 # Install Python dependencies
 RUN pip install --no-cache-dir -r requirements.txt
 
+# Pre-install SpaCy model
+RUN python -m spacy download en_core_web_sm
+
 # Copy project files
 COPY . .
 
 # Expose port
 EXPOSE 5000
 
-# Start Gunicorn server with Flask app in server.py
-CMD ["gunicorn", "-w", "4", "-b", "0.0.0.0:5000", "server:app"]
+# Start Gunicorn server with 1 worker and 2-minute timeout
+CMD ["gunicorn", "-w", "1", "-b", "0.0.0.0:5000", "--timeout", "120", "server:app"]
