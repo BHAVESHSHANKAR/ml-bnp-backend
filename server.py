@@ -81,7 +81,7 @@ logger = logging.getLogger(__name__)
 
 app = Flask(__name__)
 CORS(app, 
-     origins=['http://localhost:6969', 'http://127.0.0.1:6969'],
+     origins=['http://localhost:6969', 'http://127.0.0.1:6969','https://bnp-backend.vercel.app'],
      methods=['GET', 'POST', 'OPTIONS'],
      allow_headers=['Content-Type', 'Authorization'],
      supports_credentials=True)
@@ -1355,6 +1355,34 @@ def extract_text_only():
             "success": False,
             "error": str(e)
         }), 500
+def get_dob_pattern(country: str = "others") -> str:
+    c = (country or "").strip().lower()
+    if c in {"usa", "us", "united states", "united states of america"}:
+        return r"\b(0[1-9]|1[0-2])--(0[1-9]|[12]\d|3[01])--\d{4}\b"
+    return r"\b(0[1-9]|[12]\d|3[01])--(0[1-9]|1[0-2])--\d{4}\b"
+
+
+def analyze_image_arrays(img_color, img_gray, label="img", source="image", dob_pattern=None):
+    blurred = cv2.GaussianBlur(img_gray, (5, 5), 0)
+    edges = cv2.Canny(blurred, 50, 150)
+    edge_count = int(np.sum(edges > 0))
+    h, w = img_gray.shape[:2]
+    edge_ratio = edge_count / float(h * w)
+    rgb = cv2.cvtColor(img_color, cv2.COLOR_BGR2RGB)
+    ocr_text = pytesseract.image_to_string(rgb)
+    dob_found = bool(re.search(dob_pattern, ocr_text)) if dob_pattern else False
+    results = {
+        "edge_count": edge_count,
+        "edge_ratio": round(edge_ratio, 4),
+        "ocr_text": ocr_text,
+        "dob_found": dob_found,
+        "tamper_score": 0
+    }
+    if edge_ratio > 0.2:
+        results["tamper_score"] += 20
+    if not dob_found:
+        results["tamper_score"] += 10
+    return results
 
 @app.route('/test-risk-calculation', methods=['POST'])
 def test_risk_calculation():
